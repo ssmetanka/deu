@@ -3,6 +3,7 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
+  <meta name="referrer" content="no-referrer" />
   <meta name="apple-mobile-web-app-capable" content="yes" />
   <meta name="apple-mobile-web-app-status-bar-style" content="default" />
   <meta name="theme-color" content="#f7f5f0" />
@@ -137,6 +138,7 @@
 </head>
 <body>
   <div id="app" class="app-shell"></div>
+  <audio id="ttsAudio" referrerpolicy="no-referrer" preload="none" class="hidden"></audio>
 
   <script>
     /*************************************************************************
@@ -502,32 +504,12 @@
     const SESSION_KEY = "de_active_user_v3";
     const PROGRESS_PREFIX = "de_progress_v3_";
     const LEGACY_PREFIX = "de_app_progress_v1_";
-    const SETTINGS_KEY = "de_audio_settings_v3";
 
     // Кэш данных текущего пользователя в оперативной памяти для мгновенного отклика
     let memoryProgressCache = {
       olo: {},
       "максим": {}
     };
-
-    // Настройки озвучки
-    let audioSettings = {
-      autoSpeak: true,
-      preferCloudTts: false // Автоматически включается, если на устройстве нет немецкого голоса
-    };
-
-    try {
-      const savedSettings = localStorage.getItem(SETTINGS_KEY);
-      if (savedSettings) {
-        audioSettings = { ...audioSettings, ...JSON.parse(savedSettings) };
-      }
-    } catch (e) {}
-
-    function saveAudioSettings() {
-      try {
-        localStorage.setItem(SETTINGS_KEY, JSON.stringify(audioSettings));
-      } catch (e) {}
-    }
 
     // Инициализация IndexedDB для дублирования данных (защита от сброса кэша на iOS / Huawei)
     const IDB_NAME = "GermanLearnerDB";
@@ -600,7 +582,10 @@
       }
       const learnedSet = new Set(Array.isArray(rec.learnedIds) ? rec.learnedIds : []);
       // Если есть старый формат { correct, percent } без learnedIds, сконвертируем его
-      const legacyCorrect = typeof rec.correct === "number" ? rec.correct : 0;
+      let legacyCorrect = typeof rec.correct === "number" ? rec.correct : 0;
+      if (legacyCorrect === 0 && typeof rec.percent === "number" && rec.percent > 0) {
+        legacyCorrect = Math.round((rec.percent / 100) * 50);
+      }
       if (learnedSet.size < legacyCorrect) {
         for (let i = 0; i < legacyCorrect && i < 50; i++) {
           learnedSet.add(i);
@@ -678,7 +663,8 @@
       screen: initialSavedUser ? "categories" : "login", // "login" | "categories" | "mode_select" | "session" | "summary"
       searchQuery: "",
       selectedDeckId: 0,
-      mode: "study", // "study" | "test"
+      mode: "study", // "study" | "test" | "learned_quiz"
+      quizPool: [], // Список всех выученных слов для режима "Проверка изученных слов"
       cardIndex: 0,
       sessionCorrect: 0,
       sessionAnswered: 0,
@@ -687,8 +673,7 @@
       testInput: "",
       loginError: "",
       showSyncModal: false,
-      syncStatusMsg: "",
-      isSpeaking: false
+      syncStatusMsg: ""
     };
 
     function getUserProgress(username = state.user) {
@@ -734,11 +719,13 @@
       deckRec.correct = deckRec.learnedIds.length;
       deckRec.percent = Math.min(100, Math.round((deckRec.correct / 50) * 100));
 
-      const safeNextIdx = nextCardIdx >= 50 ? 0 : nextCardIdx;
-      if (mode === "study") {
-        deckRec.studyIndex = safeNextIdx;
-      } else {
-        deckRec.testIndex = safeNextIdx;
+      if (typeof nextCardIdx === "number" && (mode === "study" || mode === "test")) {
+        const safeNextIdx = nextCardIdx >= 50 ? 0 : nextCardIdx;
+        if (mode === "study") {
+          deckRec.studyIndex = safeNextIdx;
+        } else if (mode === "test") {
+          deckRec.testIndex = safeNextIdx;
+        }
       }
       deckRec.updatedAt = Date.now();
 
@@ -750,6 +737,31 @@
       if (!state.user) return;
       memoryProgressCache[state.user][deckId] = normalizeDeckRecord(null);
       persistUserProgressNow(state.user);
+    }
+
+    // Сбор всех изученных слов пользователя по всем 50 категориям
+    function collectAllLearnedWords(username = state.user) {
+      if (!username) return [];
+      const progressMap = getUserProgress(username);
+      const list = [];
+      for (let deckId = 0; deckId < DECKS.length; deckId++) {
+        const deck = DECKS[deckId];
+        const rec = normalizeDeckRecord(progressMap[deckId]);
+        if (rec.learnedIds && rec.learnedIds.length > 0) {
+          rec.learnedIds.forEach(wordIdx => {
+            const wordObj = deck.words[wordIdx];
+            if (wordObj) {
+              list.push({
+                deckId,
+                wordIdx,
+                wordObj,
+                deckTitle: deck.title
+              });
+            }
+          });
+        }
+      }
+      return list;
     }
 
     // Асинхронная синхронизация с IndexedDB при загрузке страницы
@@ -814,131 +826,119 @@
     }
 
     /*************************************************************************
-     * 5. ДВУХДВИЖКОВАЯ НЕМЕЦКАЯ ОЗВУЧКА (iPhone 14 iOS + Huawei Pura 70)
-     * Движок 1: Нативный Web Speech API (de-DE, голоса Anna / Helena / Google Deutsch)
-     * Движок 2: Автоматический HTML5 Audio поток (Youdao / Google TTS), если на
-     *           Huawei Pura 70 (HarmonyOS) не установлен локальный немецкий TTS-пакет.
+     * 5. НАДЁЖНАЯ НЕМЕЦКАЯ ОЗВУЧКА СТРОГО С АРТИКЛЕМ (iPhone 14 + Huawei Pura 70)
+     * 1) Всегда произносит "${article} ${de}" (например, "der Tisch", "die Lampe").
+     * 2) Запускается СТРОГО синхронно по нажатию на кнопку микрофона через
+     *    <audio id="ttsAudio" referrerpolicy="no-referrer"> с потоком Google German TTS,
+     *    благодаря чему iPhone 14 (iOS Safari) и Huawei Pura 70 произносят слова
+     *    эталонным немецким голосом, а не читают латиницу русским голосом.
+     * 3) Если телефон полностью офлайн, используется fallback на Web Speech API
+     *    ТОЛЬКО при наличии подлинного немецкого голоса (Anna, Helena, Petra, Martin и т.д.).
      *************************************************************************/
     let cachedGermanVoice = null;
-    let currentAudioEl = null;
 
-    function loadGermanVoices() {
-      if (!("speechSynthesis" in window)) return;
+    function findGenuineGermanVoice() {
+      if (!("speechSynthesis" in window)) return null;
       const voices = window.speechSynthesis.getVoices() || [];
-      if (!voices.length) return;
-      const deVoices = voices.filter(v =>
-        v.lang && (v.lang.toLowerCase().startsWith("de") || v.name.toLowerCase().includes("german") || v.name.toLowerCase().includes("deutsch"))
-      );
-      if (deVoices.length > 0) {
-        // Приоритет качественным голосам iOS (Anna, Helena, Martin) и Google Deutsch
-        cachedGermanVoice =
-          deVoices.find(v => /anna|helena|petra|marlene|viktor|google/i.test(v.name)) ||
-          deVoices.find(v => v.lang === "de-DE" || v.lang === "de_DE") ||
-          deVoices[0];
+      if (!voices.length) return null;
+
+      const noveltyRegex = /albert|bad news|bahh|bells|boing|bubbles|cellos|deranged|good news|hysterical|pipe organ|trinoids|whisper|zarvox|jester|superstar|wobble/i;
+      const deVoices = voices.filter(v => {
+        if (!v || !v.lang) return false;
+        const normLang = v.lang.replace('_', '-').toLowerCase();
+        return normLang.startsWith('de') && !noveltyRegex.test(v.name || '');
+      });
+
+      if (!deVoices.length) return null;
+
+      const preferredNames = ['anna', 'helena', 'petra', 'viktor', 'martin', 'markus', 'google deutsch', 'siri', 'marlene'];
+      for (const pref of preferredNames) {
+        const match = deVoices.find(v => (v.name || '').toLowerCase().includes(pref));
+        if (match) return match;
       }
+
+      return deVoices.find(v => v.lang.replace('_', '-').toLowerCase() === 'de-de') || deVoices[0];
     }
 
     if ("speechSynthesis" in window) {
-      loadGermanVoices();
+      cachedGermanVoice = findGenuineGermanVoice();
       if (typeof window.speechSynthesis.onvoiceschanged !== "undefined") {
-        window.speechSynthesis.onvoiceschanged = loadGermanVoices;
+        window.speechSynthesis.onvoiceschanged = () => {
+          cachedGermanVoice = findGenuineGermanVoice();
+        };
       }
     }
 
-    function triggerAudioVisualFeedback() {
-      const cardEl = document.getElementById("InteractiveImageCard");
-      const micBtn = document.getElementById("MainSpeakButton");
-      if (cardEl) {
-        cardEl.classList.remove("speaking-pulse");
-        void cardEl.offsetWidth;
-        cardEl.classList.add("speaking-pulse");
-      }
-      if (micBtn) {
-        micBtn.classList.remove("speaking-pulse");
-        void micBtn.offsetWidth;
-        micBtn.classList.add("speaking-pulse");
-      }
-    }
-
-    function playCloudGermanTts(text) {
-      try {
-        if (currentAudioEl) {
-          currentAudioEl.pause();
-          currentAudioEl = null;
-        }
-        const encoded = encodeURIComponent(text.trim());
-        // Youdao Dict Voice (le=de) отлично и быстро отдаёт немецкую озвучку на любых мобильных браузерах
-        const primaryUrl = `https://dict.youdao.com/dictvoice?audio=${encoded}&le=de`;
-        const backupUrl = `https://translate.googleapis.com/translate_tts?ie=UTF-8&q=${encoded}&tl=de&client=tw-ob`;
-
-        const audio = new Audio(primaryUrl);
-        audio.preload = "auto";
-        currentAudioEl = audio;
-
-        const playPromise = audio.play();
-        if (playPromise !== undefined) {
-          playPromise.catch(() => {
-            // Резервный поток, если первый заблокирован сетью
-            const backupAudio = new Audio(backupUrl);
-            currentAudioEl = backupAudio;
-            backupAudio.play().catch(() => {});
-          });
-        }
-      } catch (e) {}
-    }
-
-    function speakGerman(text) {
-      if (!text) return;
-      triggerAudioVisualFeedback();
-
-      // Если пользователь включил облачную озвучку или на устройстве нет Web Speech API
-      if (audioSettings.preferCloudTts || !("speechSynthesis" in window)) {
-        playCloudGermanTts(text);
-        return;
-      }
-
-      loadGermanVoices();
-
-      // На некоторых телефонах Huawei без сервисов Google список голосов пуст или нет немецкого (de-DE).
-      // В таком случае сразу используем надежный облачный аудиопоток.
-      const voices = window.speechSynthesis.getVoices() || [];
-      if (voices.length > 0 && !cachedGermanVoice) {
-        playCloudGermanTts(text);
-        return;
-      }
+    function speakOfflineGermanFallback(phrase) {
+      if (!("speechSynthesis" in window)) return;
+      const genuineVoice = cachedGermanVoice || findGenuineGermanVoice();
+      // Никогда не запускаем синтез без явно найденного немецкого голоса,
+      // чтобы iOS не читала немецкие буквы русским голосом
+      if (!genuineVoice) return;
 
       try {
         window.speechSynthesis.cancel();
-        if (window.speechSynthesis.paused) {
-          window.speechSynthesis.resume();
-        }
-
-        const utter = new SpeechSynthesisUtterance(text);
+        const utter = new SpeechSynthesisUtterance(phrase);
+        utter.voice = genuineVoice;
         utter.lang = "de-DE";
         utter.rate = 0.9;
         utter.pitch = 1.0;
-        if (cachedGermanVoice) {
-          utter.voice = cachedGermanVoice;
-        }
-
-        let started = false;
-        utter.onstart = () => {
-          started = true;
-        };
-        utter.onerror = () => {
-          if (!started) playCloudGermanTts(text);
-        };
-
         window.speechSynthesis.speak(utter);
+      } catch (e) {}
+    }
 
-        // Страховка для мобильных WebView, где speechSynthesis.speak() молча не запускается
-        setTimeout(() => {
-          if (!started && !window.speechSynthesis.speaking) {
-            playCloudGermanTts(text);
+    function speakGermanWordWithArticle(wordObj, buttonEl = null) {
+      if (!wordObj || !wordObj.article || !wordObj.de) return;
+      const phrase = `${wordObj.article} ${wordObj.de}`.trim();
+
+      const targetBtn = buttonEl || document.getElementById("MainSpeakButton");
+      if (targetBtn) {
+        targetBtn.classList.remove("speaking-pulse");
+        void targetBtn.offsetWidth;
+        targetBtn.classList.add("speaking-pulse");
+      }
+
+      if ("speechSynthesis" in window) {
+        try { window.speechSynthesis.cancel(); } catch (e) {}
+      }
+
+      const audioEl = document.getElementById("ttsAudio");
+      if (!audioEl) {
+        speakOfflineGermanFallback(phrase);
+        return;
+      }
+
+      const encoded = encodeURIComponent(phrase);
+      const googleTtsUrl = `https://translate.google.com/translate_tts?ie=UTF-8&client=tw-ob&tl=de&q=${encoded}`;
+      const backupTtsUrl = `https://dict.youdao.com/dictvoice?audio=${encoded}&le=de`;
+
+      try {
+        audioEl.pause();
+        audioEl.onerror = () => {
+          audioEl.onerror = () => {
+            speakOfflineGermanFallback(phrase);
+          };
+          audioEl.src = backupTtsUrl;
+          const p2 = audioEl.play();
+          if (p2 !== undefined) {
+            p2.catch(() => speakOfflineGermanFallback(phrase));
           }
-        }, 650);
-      } catch (e) {
-        playCloudGermanTts(text);
+        };
+
+        audioEl.src = googleTtsUrl;
+        const playPromise = audioEl.play();
+        if (playPromise !== undefined) {
+          playPromise.catch(() => {
+            audioEl.onerror = null;
+            audioEl.src = backupTtsUrl;
+            const p2 = audioEl.play();
+            if (p2 !== undefined) {
+              p2.catch(() => speakOfflineGermanFallback(phrase));
+            }
+          });
+        }
+      } catch (err) {
+        speakOfflineGermanFallback(phrase);
       }
     }
 
@@ -1079,7 +1079,6 @@
             localStorage.setItem(SESSION_KEY, rawLogin);
           } catch (err) {}
           idbSet(SESSION_KEY, rawLogin);
-          // Подгружаем сохраненный прогресс пользователя
           memoryProgressCache[rawLogin] = loadProgressFromLocalStorage(rawLogin);
           state.screen = "categories";
           render();
@@ -1090,17 +1089,12 @@
       });
     }
 
-    /* ЭКРАН 2: СПИСОК 50 КАТЕГОРИЙ */
+    /* ЭКРАН 2: СПИСОК 50 КАТЕГОРИЙ + БАННЕР ПРОВЕРКИ ПО ВСЕМ ИЗУЧЕННЫМ СЛОВАМ */
     function renderCategories() {
       const progressMap = getUserProgress();
       const userObj = VALID_USERS[state.user];
-
-      // Подсчет общего прогресса по всем 50 колодам
-      let totalLearnedWords = 0;
-      for (let i = 0; i < DECKS.length; i++) {
-        const p = normalizeDeckRecord(progressMap[i]);
-        totalLearnedWords += p.correct || 0;
-      }
+      const allLearnedList = collectAllLearnedWords(state.user);
+      const totalLearnedWords = allLearnedList.length;
       const overallPercent = Math.round((totalLearnedWords / 2500) * 100);
 
       const filteredDecks = DECKS.filter(d =>
@@ -1109,7 +1103,7 @@
 
       appEl.innerHTML = `
         <div class="flex flex-col h-full animate-card">
-          <!-- Компактная панель профиля и поиска -->
+          <!-- Компактная панель профиля, общей проверки и поиска -->
           <div class="bg-white rounded-3xl p-3.5 shadow-sm border border-stone-200/70 mb-2.5">
             <div class="flex items-center justify-between mb-2.5">
               <div class="flex items-center gap-2.5 min-w-0">
@@ -1120,10 +1114,10 @@
                   <div class="flex items-center gap-1.5">
                     <span class="text-sm font-bold text-stone-800 truncate">${userObj.displayName}</span>
                     <span class="inline-flex items-center px-1.5 py-0.5 rounded-md text-[10px] font-semibold bg-emerald-50 text-emerald-700 border border-emerald-200/60">
-                      ✓ Автосохранение
+                      ✓ Сохранено
                     </span>
                   </div>
-                  <div class="text-[11px] text-stone-400">Выучено ${totalLearnedWords} из 2500 слов (${overallPercent}%)</div>
+                  <div class="text-[11px] text-stone-400">Изучено ${totalLearnedWords} из 2500 слов (${overallPercent}%)</div>
                 </div>
               </div>
               <div class="flex items-center gap-1.5 shrink-0">
@@ -1134,6 +1128,30 @@
                   Выйти
                 </button>
               </div>
+            </div>
+
+            <!-- Баннер/кнопка: Проверка по всем изученным словам -->
+            <div class="mb-2.5">
+              <button
+                id="startAllLearnedQuizBtn"
+                type="button"
+                ${totalLearnedWords === 0 ? 'disabled' : ''}
+                class="soft-btn w-full py-2.5 px-3.5 rounded-2xl flex items-center justify-between text-xs font-semibold transition ${
+                  totalLearnedWords > 0
+                    ? 'bg-stone-800 text-white shadow-sm'
+                    : 'bg-stone-100 text-stone-400 cursor-not-allowed'
+                }"
+              >
+                <span class="flex items-center gap-2">
+                  <span>🎯</span>
+                  <span>Проверка изученных слов</span>
+                </span>
+                <span class="px-2 py-0.5 rounded-lg text-[11px] ${
+                  totalLearnedWords > 0 ? 'bg-white/15 text-white' : 'bg-stone-200/70 text-stone-400'
+                }">
+                  ${totalLearnedWords > 0 ? `${totalLearnedWords} сл. →` : '0 слов'}
+                </span>
+              </button>
             </div>
 
             <div class="relative">
@@ -1171,7 +1189,7 @@
                     </div>
                     <div class="text-[11px] text-stone-400 mt-0.5 mb-1.5">
                       Изучено слов: <b class="text-stone-600">${prog.correct}/50</b>
-                      ${prog.studyIndex > 0 ? ` · Остановились на #${prog.studyIndex + 1}` : ''}
+                      ${prog.studyIndex > 0 ? ` · Карта #${prog.studyIndex + 1}` : ''}
                     </div>
                     <div class="w-full h-1.5 bg-stone-100 rounded-full overflow-hidden">
                       <div class="h-full ${barColor} rounded-full transition-all duration-300" style="width: ${prog.percent}%"></div>
@@ -1187,9 +1205,7 @@
       `;
 
       document.getElementById("logoutBtn").addEventListener("click", () => {
-        // Сначала принудительно сохраняем весь прогресс текущего пользователя
         persistUserProgressNow(state.user);
-        // Удаляем ТОЛЬКО активную сессию, сам прогресс в localStorage и IndexedDB остаётся нетронутым!
         try {
           localStorage.removeItem(SESSION_KEY);
           localStorage.removeItem("de_app_active_user_v1");
@@ -1205,6 +1221,13 @@
         state.syncStatusMsg = "";
         render();
       });
+
+      const allLearnedBtn = document.getElementById("startAllLearnedQuizBtn");
+      if (allLearnedBtn) {
+        allLearnedBtn.addEventListener("click", () => {
+          startAllLearnedQuiz();
+        });
+      }
 
       if (state.showSyncModal) {
         bindSyncModalEvents();
@@ -1239,6 +1262,32 @@
       });
     }
 
+    // Запуск проверки по всем изученным словам пользователя (в случайном порядке)
+    function startAllLearnedQuiz() {
+      const learnedPool = collectAllLearnedWords(state.user);
+      if (!learnedPool.length) return;
+
+      // Перемешиваем изученные слова случайным образом (Fisher-Yates)
+      const shuffled = [...learnedPool];
+      for (let i = shuffled.length - 1; i > 0; i--) {
+        const j = Math.floor(Math.random() * (i + 1));
+        const tmp = shuffled[i];
+        shuffled[i] = shuffled[j];
+        shuffled[j] = tmp;
+      }
+
+      state.mode = "learned_quiz";
+      state.quizPool = shuffled;
+      state.cardIndex = 0;
+      state.sessionCorrect = 0;
+      state.sessionAnswered = 0;
+      state.mistakes = [];
+      state.feedback = null;
+      state.testInput = "";
+      state.screen = "session";
+      render();
+    }
+
     function renderSyncModal() {
       const code = generateBackupCode();
       return `
@@ -1249,7 +1298,7 @@
               <button id="closeSyncBtn" class="text-stone-400 text-sm px-2 py-1">✕</button>
             </div>
             <p class="text-[11px] text-stone-500 leading-relaxed mb-3">
-              Ваш прогресс сохраняется на этом телефоне автоматически. Если вы хотите перенести прогресс из браузера Safari в иконку «На экран Домой» или на другой телефон — скопируйте этот код:
+              Ваш прогресс сохраняется автоматически. Если вы хотите перенести его между браузером и иконкой «На экран Домой» или на другое устройство — скопируйте код:
             </p>
             <textarea
               id="backupCodeArea"
@@ -1329,12 +1378,12 @@
           </div>
 
           <div class="bg-white rounded-3xl p-5 shadow-sm border border-stone-200/80 text-center my-auto">
-            <div class="w-18 h-18 w-16 h-16 rounded-3xl bg-stone-50 border border-stone-100 flex items-center justify-center text-4xl mx-auto mb-2.5">
+            <div class="w-16 h-16 rounded-3xl bg-stone-50 border border-stone-100 flex items-center justify-center text-4xl mx-auto mb-2.5">
               ${deck.icon}
             </div>
             <h2 class="text-lg font-bold text-stone-800">${deck.title}</h2>
             <p class="text-xs text-stone-400 mt-0.5 mb-5">
-              Прогресс сохраняется после каждого слова
+              50 самых нужных существительных · выберите режим
             </p>
 
             <div class="space-y-2.5 text-left">
@@ -1345,10 +1394,10 @@
                 <div class="flex-1">
                   <div class="flex items-center justify-between">
                     <span class="text-sm font-bold text-stone-800">1. Изучение</span>
-                    ${prog.studyIndex > 0 ? `<span class="text-[11px] font-semibold text-blue-600">Продолжить с #${prog.studyIndex + 1} →</span>` : ''}
+                    ${prog.studyIndex > 0 ? `<span class="text-[11px] font-semibold text-blue-600">С карты #${prog.studyIndex + 1} →</span>` : ''}
                   </div>
                   <div class="text-[11px] text-stone-500 leading-snug mt-0.5">
-                    Картинка в рамке цвета рода (<span class="text-blue-600 font-semibold">der</span>, <span class="text-pink-600 font-semibold">die</span>, <span class="text-emerald-600 font-semibold">das</span>) + озвучка по нажатию на картинку
+                    Картинка в рамке цвета рода (<span class="text-blue-600 font-semibold">der</span>, <span class="text-pink-600 font-semibold">die</span>, <span class="text-emerald-600 font-semibold">das</span>) и выбор артикля из трёх
                   </div>
                 </div>
               </button>
@@ -1360,29 +1409,18 @@
                 <div class="flex-1">
                   <div class="flex items-center justify-between">
                     <span class="text-sm font-bold text-stone-800">2. Проверка</span>
-                    ${prog.testIndex > 0 ? `<span class="text-[11px] font-semibold text-emerald-600">Продолжить с #${prog.testIndex + 1} →</span>` : ''}
+                    ${prog.testIndex > 0 ? `<span class="text-[11px] font-semibold text-emerald-600">С карты #${prog.testIndex + 1} →</span>` : ''}
                   </div>
                   <div class="text-[11px] text-stone-500 leading-snug mt-0.5">
-                    Картинка без цветной подсказки + письменный ввод артикля со словом
+                    Картинка без цветной рамки + ввод артикля вместе со словом
                   </div>
                 </div>
-              </button>
-            </div>
-
-            <!-- Переключатель автоозвучки и движка звука -->
-            <div class="mt-4 pt-3.5 border-t border-stone-100 flex items-center justify-between text-xs text-stone-500">
-              <label class="flex items-center gap-2 cursor-pointer">
-                <input id="autoSpeakToggle" type="checkbox" ${audioSettings.autoSpeak ? 'checked' : ''} class="rounded text-stone-800" />
-                <span>Автоозвучка слова</span>
-              </label>
-              <button id="toggleVoiceEngineBtn" type="button" class="text-[11px] font-medium px-2.5 py-1 rounded-lg bg-stone-100 text-stone-600">
-                🔊 Голос: ${audioSettings.preferCloudTts ? 'Онлайн HD' : 'Системный DE'}
               </button>
             </div>
           </div>
 
           <div class="text-center text-[11px] text-stone-400">
-            Профиль: <b>${VALID_USERS[state.user].displayName}</b> · Нажмите на картинку для произношения
+            Профиль: <b>${VALID_USERS[state.user].displayName}</b>
           </div>
         </div>
       `;
@@ -1399,18 +1437,6 @@
           render();
         });
       }
-
-      document.getElementById("autoSpeakToggle").addEventListener("change", (e) => {
-        audioSettings.autoSpeak = e.target.checked;
-        saveAudioSettings();
-      });
-
-      document.getElementById("toggleVoiceEngineBtn").addEventListener("click", () => {
-        audioSettings.preferCloudTts = !audioSettings.preferCloudTts;
-        saveAudioSettings();
-        speakGerman("Hallo");
-        render();
-      });
 
       document.getElementById("startStudyBtn").addEventListener("click", () => {
         startDeckSession("study", prog.studyIndex || 0);
@@ -1431,20 +1457,37 @@
       state.testInput = "";
       state.screen = "session";
       render();
-      // Если включена автоозвучка в режиме изучения — сразу озвучиваем открытую карточку
-      if (audioSettings.autoSpeak && mode === "study") {
-        const w = DECKS[state.selectedDeckId].words[state.cardIndex];
-        setTimeout(() => speakGerman(w.de), 120);
-      }
     }
 
-    /* ЭКРАН 4: ТРЕНИРОВКА (РЕЖИМ 1: ИЗУЧЕНИЕ / РЕЖИМ 2: ПРОВЕРКА) */
+    /* ЭКРАН 4: ТРЕНИРОВКА (ИЗУЧЕНИЕ / ПРОВЕРКА КОЛОДЫ / ПРОВЕРКА ВСЕХ ИЗУЧЕННЫХ СЛОВ) */
     function renderSession() {
-      const deck = DECKS[state.selectedDeckId];
-      const wordObj = deck.words[state.cardIndex];
-      const total = deck.words.length;
-      const deckProg = getDeckState(deck.id);
-      const isAlreadyLearned = deckProg.learnedIds.includes(state.cardIndex);
+      const isLearnedQuiz = state.mode === "learned_quiz";
+      let wordObj = null;
+      let total = 0;
+      let headerInfoHtml = "";
+      let isAlreadyLearned = false;
+      let currentDeckTitle = "";
+
+      if (isLearnedQuiz) {
+        total = state.quizPool.length;
+        const item = state.quizPool[state.cardIndex];
+        wordObj = item.wordObj;
+        currentDeckTitle = item.deckTitle;
+        isAlreadyLearned = true;
+        headerInfoHtml = `
+          Слово ${state.cardIndex + 1}/${total} · <span class="text-emerald-600 font-bold">Верно: ${state.sessionCorrect}/${state.sessionAnswered}</span>
+        `;
+      } else {
+        const deck = DECKS[state.selectedDeckId];
+        wordObj = deck.words[state.cardIndex];
+        total = deck.words.length;
+        const deckProg = getDeckState(deck.id);
+        isAlreadyLearned = deckProg.learnedIds.includes(state.cardIndex);
+        headerInfoHtml = `
+          Карта ${state.cardIndex + 1}/${total} · <span class="text-emerald-600 font-bold">Изучено: ${deckProg.correct}/50 (${deckProg.percent}%)</span>
+        `;
+      }
+
       const progressPct = Math.round(((state.cardIndex + 1) / total) * 100);
 
       let frameClass = "frame-neutral";
@@ -1460,26 +1503,22 @@
           frameClass = "frame-das";
           genderBadge = `<span class="px-2.5 py-0.5 rounded-full text-[11px] font-semibold bg-emerald-100 text-emerald-700">средний род · зелёный</span>`;
         }
+      } else if (isLearnedQuiz) {
+        genderBadge = `<span class="px-2.5 py-0.5 rounded-full text-[11px] font-medium bg-stone-100 text-stone-600">${currentDeckTitle}</span>`;
       } else {
         genderBadge = `<span class="px-2.5 py-0.5 rounded-full text-[11px] font-medium bg-stone-100 text-stone-500">Проверка без подсказки рода</span>`;
       }
 
-      // Что озвучивать при клике на картинку или кнопку микрофона/динамика:
-      // До ответа в режиме проверки озвучиваем само немецкое существительное, а после ответа (или в изучении) — артикль + слово
-      const textToSpeakOnTap = (state.mode === "study" && state.feedback) || (state.mode === "test" && state.feedback)
-        ? `${wordObj.article} ${wordObj.de}`
-        : wordObj.de;
-
       appEl.innerHTML = `
         <div class="flex-1 flex flex-col justify-between h-full animate-card">
-          <!-- Верхняя строка навигации и сохраняемого прогресса по колоде -->
+          <!-- Верхняя строка навигации и сохраняемого прогресса -->
           <div>
             <div class="flex items-center justify-between mb-1.5">
               <button id="exitSessionBtn" class="soft-btn px-3 py-1.5 rounded-xl bg-white border border-stone-200/80 text-xs font-medium text-stone-600">
                 ← Категории
               </button>
               <div class="text-xs font-semibold text-stone-500">
-                Карта ${state.cardIndex + 1}/${total} · <span class="text-emerald-600 font-bold">Изучено: ${deckProg.correct}/50 (${deckProg.percent}%)</span>
+                ${headerInfoHtml}
               </div>
               <button id="finishNowBtn" class="soft-btn px-3 py-1.5 rounded-xl bg-white border border-stone-200/80 text-xs font-medium text-stone-600">
                 Итог
@@ -1490,43 +1529,30 @@
             </div>
           </div>
 
-          <!-- Центральная область: ВСЯ КАРТИНКА КЛИКАБЕЛЬНА ДЛЯ ОЗВУЧКИ + КНОПКА МИКРОФОНА/ДИНАМИКА -->
+          <!-- Центральная область: чистая картинка без оверлеев и кнопка микрофона рядом со словом -->
           <div class="my-auto py-1 flex flex-col items-center">
             <div class="mb-2 flex items-center gap-1.5">
               ${genderBadge}
-              ${isAlreadyLearned ? `<span class="px-2 py-0.5 rounded-full text-[10px] font-semibold bg-emerald-50 text-emerald-700 border border-emerald-200">✓ Выучено</span>` : ''}
+              ${!isLearnedQuiz && isAlreadyLearned ? `<span class="px-2 py-0.5 rounded-full text-[10px] font-semibold bg-emerald-50 text-emerald-700 border border-emerald-200">✓ Выучено</span>` : ''}
             </div>
 
-            <!-- Интерактивная картинка: нажатие в любое место картинки озвучивает слово по-немецки -->
-            <div
-              id="InteractiveImageCard"
-              role="button"
-              tabindex="0"
-              aria-label="Озвучить слово по-немецки"
-              class="soft-btn cursor-pointer relative w-full max-w-[265px] aspect-[240/165] rounded-3xl p-2 transition-all duration-200 ${frameClass}"
-            >
+            <div class="relative w-full max-w-[265px] aspect-[240/165] rounded-3xl p-2 transition-all duration-200 ${frameClass}">
               ${renderSvgIllustration(wordObj, state.mode, wordObj.article)}
-
-              <!-- Кнопка микрофона/озвучки прямо на карточке -->
-              <div class="absolute bottom-3 right-3 px-2.5 py-1 rounded-full bg-white/90 backdrop-blur-xs border border-stone-200/80 shadow-sm flex items-center gap-1 text-[11px] font-semibold text-stone-700 pointer-events-none">
-                <span>🔊</span>
-                <span>Нажмите для озвучки</span>
-              </div>
             </div>
 
-            <!-- Подпись и отдельная кнопка озвучки под картинкой -->
+            <!-- Слово и аккуратная круглая кнопка микрофона (строго по нажатию) -->
             <div class="text-center mt-2.5">
               ${state.mode === "study" ? `
                 <div class="flex items-center justify-center gap-2">
-                  <h3 id="WordTitleTap" class="text-2xl font-bold text-stone-800 tracking-tight cursor-pointer">${wordObj.de}</h3>
+                  <h3 class="text-2xl font-bold text-stone-800 tracking-tight">${wordObj.de}</h3>
                   <button
                     id="MainSpeakButton"
                     type="button"
-                    class="soft-btn px-3 py-1.5 rounded-full bg-stone-800 text-white flex items-center gap-1.5 text-xs font-semibold shadow-sm"
-                    title="Произнести по-немецки"
+                    aria-label="Озвучить артикль и слово по-немецки"
+                    class="soft-btn w-9 h-9 rounded-full bg-stone-100 hover:bg-stone-200 border border-stone-200/80 text-stone-700 flex items-center justify-center text-base shadow-xs"
+                    title="Озвучить с артиклем"
                   >
-                    <span>🎙️</span>
-                    <span>Слушать</span>
+                    🎙️
                   </button>
                 </div>
                 <p class="text-sm text-stone-500 mt-0.5">${wordObj.ru}</p>
@@ -1536,11 +1562,11 @@
                   <button
                     id="MainSpeakButton"
                     type="button"
-                    class="soft-btn px-3 py-1 rounded-full bg-stone-800 text-white flex items-center gap-1 text-xs font-semibold shadow-sm"
-                    title="Прослушать немецкое слово"
+                    aria-label="Озвучить артикль и слово по-немецки"
+                    class="soft-btn w-9 h-9 rounded-full bg-stone-100 hover:bg-stone-200 border border-stone-200/80 text-stone-700 flex items-center justify-center text-base shadow-xs"
+                    title="Озвучить с артиклем"
                   >
-                    <span>🎙️</span>
-                    <span>Озвучить</span>
+                    🎙️
                   </button>
                 </div>
                 <p class="text-xs text-stone-400 mt-0.5">Впишите артикль и немецкое слово</p>
@@ -1555,7 +1581,6 @@
         </div>
       `;
 
-      // При выходе весь накопленный прогресс уже сохранён в localStorage и IndexedDB
       document.getElementById("exitSessionBtn").addEventListener("click", () => {
         persistUserProgressNow(state.user);
         state.screen = "categories";
@@ -1568,28 +1593,12 @@
         render();
       });
 
-      // Озвучка при нажатии на ВСЮ картинку над словом
-      const imageCard = document.getElementById("InteractiveImageCard");
-      if (imageCard) {
-        imageCard.addEventListener("click", () => {
-          speakGerman(textToSpeakOnTap);
-        });
-      }
-
-      // Озвучка при нажатии на само немецкое слово
-      const wordTitleTap = document.getElementById("WordTitleTap");
-      if (wordTitleTap) {
-        wordTitleTap.addEventListener("click", () => {
-          speakGerman(textToSpeakOnTap);
-        });
-      }
-
-      // Озвучка при нажатии на кнопку микрофона/динамика
+      // Озвучка СТРОГО по нажатию на кнопку микрофона и СТРОГО с артиклем (der/die/das + Wort)
       const speakBtn = document.getElementById("MainSpeakButton");
       if (speakBtn) {
         speakBtn.addEventListener("click", (e) => {
           e.stopPropagation();
-          speakGerman(textToSpeakOnTap);
+          speakGermanWordWithArticle(wordObj, speakBtn);
         });
       }
 
@@ -1648,7 +1657,7 @@
             });
           }
 
-          // Сразу же сохраняем результат этой карточки и следующую позицию в колоде!
+          // Мгновенно сохраняем результат этой карточки в localStorage и IndexedDB
           recordCardProgress(
             state.selectedDeckId,
             state.cardIndex,
@@ -1656,10 +1665,6 @@
             state.cardIndex + 1,
             "study"
           );
-
-          if (audioSettings.autoSpeak) {
-            speakGerman(`${wordObj.article} ${wordObj.de}`);
-          }
 
           if (isCorrect) {
             advanceOrSummarize();
@@ -1794,17 +1799,19 @@
             });
           }
 
-          // Мгновенно сохраняем прогресс карточки
-          recordCardProgress(
-            state.selectedDeckId,
-            state.cardIndex,
-            isCorrect,
-            state.cardIndex + 1,
-            "test"
-          );
-
-          if (audioSettings.autoSpeak) {
-            speakGerman(`${wordObj.article} ${wordObj.de}`);
+          if (state.mode === "learned_quiz") {
+            const item = state.quizPool[state.cardIndex];
+            if (item) {
+              recordCardProgress(item.deckId, item.wordIdx, isCorrect, null, "learned_quiz");
+            }
+          } else {
+            recordCardProgress(
+              state.selectedDeckId,
+              state.cardIndex,
+              isCorrect,
+              state.cardIndex + 1,
+              "test"
+            );
           }
 
           state.feedback = {
@@ -1828,8 +1835,11 @@
     }
 
     function advanceOrSummarize() {
-      const deck = DECKS[state.selectedDeckId];
-      if (state.cardIndex + 1 < deck.words.length) {
+      const totalLen = state.mode === "learned_quiz"
+        ? state.quizPool.length
+        : DECKS[state.selectedDeckId].words.length;
+
+      if (state.cardIndex + 1 < totalLen) {
         state.cardIndex++;
         render();
       } else {
@@ -1839,36 +1849,63 @@
       }
     }
 
-    /* ЭКРАН 5: ИТОГ ПО КОЛОДЕ */
+    /* ЭКРАН 5: ИТОГ ПО КОЛОДЕ ИЛИ ПО ВСЕМ ИЗУЧЕННЫМ СЛОВАМ */
     function renderSummary() {
-      const deck = DECKS[state.selectedDeckId];
-      const deckProg = getDeckState(deck.id);
+      const isLearnedQuiz = state.mode === "learned_quiz";
+      let title = "";
+      let subtitle = "";
+      let statLeftTop = "";
+      let statLeftBottom = "";
+      let statRightTop = "";
+      let statRightBottom = "";
+      let badgeEmoji = "🌱";
+
+      if (isLearnedQuiz) {
+        const accuracy = state.sessionAnswered > 0
+          ? Math.round((state.sessionCorrect / state.sessionAnswered) * 100)
+          : 0;
+        badgeEmoji = accuracy >= 80 ? "🏆" : accuracy >= 50 ? "👏" : "🎯";
+        title = "Проверка изученных слов";
+        subtitle = `Профиль: ${VALID_USERS[state.user].displayName} · Всего в пуле: ${state.quizPool.length} сл.`;
+        statLeftTop = `${state.sessionCorrect} / ${state.sessionAnswered}`;
+        statLeftBottom = "Верных ответов в сессии";
+        statRightTop = `${accuracy}%`;
+        statRightBottom = "Точность проверки";
+      } else {
+        const deck = DECKS[state.selectedDeckId];
+        const deckProg = getDeckState(deck.id);
+        badgeEmoji = deckProg.percent >= 80 ? "🏆" : deckProg.percent >= 50 ? "👏" : "🌱";
+        title = deck.title;
+        subtitle = `Режим: ${state.mode === "study" ? "Изучение" : "Проверка"} · Профиль: ${VALID_USERS[state.user].displayName}`;
+        statLeftTop = `${deckProg.correct} / 50`;
+        statLeftBottom = "Всего изучено в колоде";
+        statRightTop = `${deckProg.percent}%`;
+        statRightBottom = "Сохранённый прогресс";
+      }
 
       appEl.innerHTML = `
         <div class="flex-1 flex flex-col h-full animate-card">
           <div class="bg-white rounded-3xl p-5 shadow-sm border border-stone-200/80 text-center mb-3">
             <div class="w-16 h-16 rounded-3xl bg-stone-50 border border-stone-100 flex items-center justify-center text-3xl mx-auto mb-2">
-              ${deckProg.percent >= 80 ? '🏆' : deckProg.percent >= 50 ? '👏' : '🌱'}
+              ${badgeEmoji}
             </div>
-            <h2 class="text-lg font-bold text-stone-800">${deck.title}</h2>
-            <p class="text-xs text-stone-400 mt-0.5">
-              Режим: ${state.mode === "study" ? "Изучение" : "Проверка"} · Профиль: ${VALID_USERS[state.user].displayName}
-            </p>
+            <h2 class="text-lg font-bold text-stone-800">${title}</h2>
+            <p class="text-xs text-stone-400 mt-0.5">${subtitle}</p>
 
             <div class="grid grid-cols-2 gap-2.5 my-4">
               <div class="p-3 rounded-2xl bg-stone-50 border border-stone-100">
-                <div class="text-xl font-bold text-stone-800">${deckProg.correct} / 50</div>
-                <div class="text-[11px] text-stone-400">Всего изучено в колоде</div>
+                <div class="text-xl font-bold text-stone-800">${statLeftTop}</div>
+                <div class="text-[11px] text-stone-400">${statLeftBottom}</div>
               </div>
               <div class="p-3 rounded-2xl bg-stone-50 border border-stone-100">
-                <div class="text-xl font-bold text-emerald-600">${deckProg.percent}%</div>
-                <div class="text-[11px] text-stone-400">Сохранённый прогресс</div>
+                <div class="text-xl font-bold text-emerald-600">${statRightTop}</div>
+                <div class="text-[11px] text-stone-400">${statRightBottom}</div>
               </div>
             </div>
 
             <div class="flex gap-2">
               <button id="retryDeckBtn" class="soft-btn flex-1 py-3 rounded-2xl bg-stone-100 text-stone-700 font-semibold text-xs">
-                Пройти сначала
+                ${isLearnedQuiz ? 'Ещё раз' : 'Пройти сначала'}
               </button>
               <button id="toCategoriesBtn" class="soft-btn flex-1 py-3 rounded-2xl bg-stone-800 text-white font-semibold text-xs">
                 К 50 категориям
@@ -1876,7 +1913,7 @@
             </div>
           </div>
 
-          <!-- Список ошибок (с возможностью нажать и прослушать произношение каждого слова) -->
+          <!-- Список ошибок (с кнопкой микрофона для озвучки каждого слова с артиклем) -->
           <div class="scroll-area space-y-2 pb-4">
             ${state.mistakes.length === 0 ? `
               <div class="bg-white rounded-2xl p-5 text-center border border-stone-200/60 text-xs text-stone-400">
@@ -1884,7 +1921,7 @@
               </div>
             ` : `
               <div class="text-xs font-semibold text-stone-500 px-1 mb-1">
-                Слова для повторения (нажмите для озвучки):
+                Ошибки в сессии:
               </div>
               ${state.mistakes.map((m, idx) => {
                 const badgeColor = m.wordObj.article === 'der'
@@ -1893,23 +1930,26 @@
                     ? 'bg-pink-100 text-pink-700'
                     : 'bg-emerald-100 text-emerald-700';
                 return `
-                  <button
-                    type="button"
-                    data-speak="${m.wordObj.article} ${m.wordObj.de}"
-                    class="mistake-speak-btn soft-btn w-full text-left bg-white rounded-2xl p-3 border border-stone-200/70 flex items-center justify-between gap-2"
-                  >
-                    <div class="flex items-center gap-2.5">
-                      <span class="text-xl">${m.wordObj.emoji}</span>
-                      <div>
-                        <div class="text-xs font-bold text-stone-800">
+                  <div class="w-full bg-white rounded-2xl p-3 border border-stone-200/70 flex items-center justify-between gap-2">
+                    <div class="flex items-center gap-2.5 min-w-0">
+                      <span class="text-xl shrink-0">${m.wordObj.emoji}</span>
+                      <div class="min-w-0">
+                        <div class="text-xs font-bold text-stone-800 truncate">
                           <span class="px-1.5 py-0.5 rounded-md ${badgeColor}">${m.wordObj.article}</span>
-                          ${m.wordObj.de} 🔊
+                          ${m.wordObj.de}
                         </div>
-                        <div class="text-[11px] text-stone-400">${m.wordObj.ru}</div>
+                        <div class="text-[11px] text-stone-400 truncate">${m.wordObj.ru} · <span class="text-rose-500 line-through">${m.userAnswer}</span></div>
                       </div>
                     </div>
-                    <div class="text-[11px] text-rose-500 line-through">${m.userAnswer}</div>
-                  </button>
+                    <button
+                      type="button"
+                      data-mistake-idx="${idx}"
+                      aria-label="Озвучить с артиклем"
+                      class="mistake-mic-btn soft-btn w-9 h-9 rounded-full bg-stone-100 hover:bg-stone-200 border border-stone-200/80 text-stone-700 flex items-center justify-center text-sm shrink-0"
+                    >
+                      🎙️
+                    </button>
+                  </div>
                 `;
               }).join('')}
             `}
@@ -1917,14 +1957,22 @@
         </div>
       `;
 
-      document.querySelectorAll(".mistake-speak-btn").forEach(btn => {
+      document.querySelectorAll(".mistake-mic-btn").forEach(btn => {
         btn.addEventListener("click", () => {
-          speakGerman(btn.getAttribute("data-speak"));
+          const idx = parseInt(btn.getAttribute("data-mistake-idx"), 10);
+          const mistake = state.mistakes[idx];
+          if (mistake && mistake.wordObj) {
+            speakGermanWordWithArticle(mistake.wordObj, btn);
+          }
         });
       });
 
       document.getElementById("retryDeckBtn").addEventListener("click", () => {
-        startDeckSession(state.mode, 0);
+        if (isLearnedQuiz) {
+          startAllLearnedQuiz();
+        } else {
+          startDeckSession(state.mode, 0);
+        }
       });
 
       document.getElementById("toCategoriesBtn").addEventListener("click", () => {
