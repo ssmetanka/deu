@@ -576,6 +576,7 @@
           correct: 0,
           percent: 0,
           studyIndex: 0,
+          articleQuizIndex: 0,
           testIndex: 0,
           updatedAt: 0
         };
@@ -599,6 +600,7 @@
         correct,
         percent,
         studyIndex: Number.isInteger(rec.studyIndex) && rec.studyIndex >= 0 && rec.studyIndex < 50 ? rec.studyIndex : 0,
+        articleQuizIndex: Number.isInteger(rec.articleQuizIndex) && rec.articleQuizIndex >= 0 && rec.articleQuizIndex < 50 ? rec.articleQuizIndex : 0,
         testIndex: Number.isInteger(rec.testIndex) && rec.testIndex >= 0 && rec.testIndex < 50 ? rec.testIndex : 0,
         updatedAt: rec.updatedAt || Date.now()
       };
@@ -620,6 +622,7 @@
           correct,
           percent,
           studyIndex: newer.studyIndex || 0,
+          articleQuizIndex: newer.articleQuizIndex || 0,
           testIndex: newer.testIndex || 0,
           updatedAt: Math.max(a.updatedAt || 0, b.updatedAt || 0, Date.now())
         };
@@ -658,12 +661,20 @@
       localStorage.getItem(SESSION_KEY) || localStorage.getItem("de_app_active_user_v1")
     );
 
+    let autoAdvanceTimer = null;
+    function clearAutoAdvanceTimer() {
+      if (autoAdvanceTimer) {
+        clearTimeout(autoAdvanceTimer);
+        autoAdvanceTimer = null;
+      }
+    }
+
     const state = {
       user: initialSavedUser,
       screen: initialSavedUser ? "categories" : "login", // "login" | "categories" | "mode_select" | "session" | "summary"
       searchQuery: "",
       selectedDeckId: 0,
-      mode: "study", // "study" | "test" | "learned_quiz"
+      mode: "study", // "study" | "article_quiz" | "test" | "learned_quiz"
       quizPool: [], // Список всех выученных слов для режима "Проверка изученных слов"
       cardIndex: 0,
       sessionCorrect: 0,
@@ -719,10 +730,12 @@
       deckRec.correct = deckRec.learnedIds.length;
       deckRec.percent = Math.min(100, Math.round((deckRec.correct / 50) * 100));
 
-      if (typeof nextCardIdx === "number" && (mode === "study" || mode === "test")) {
+      if (typeof nextCardIdx === "number" && (mode === "study" || mode === "article_quiz" || mode === "test")) {
         const safeNextIdx = nextCardIdx >= 50 ? 0 : nextCardIdx;
         if (mode === "study") {
           deckRec.studyIndex = safeNextIdx;
+        } else if (mode === "article_quiz") {
+          deckRec.articleQuizIndex = safeNextIdx;
         } else if (mode === "test") {
           deckRec.testIndex = safeNextIdx;
         }
@@ -799,9 +812,9 @@
     /*************************************************************************
      * 4. ГЕНЕРАТОР МГНОВЕННЫХ ВЕКТОРНЫХ SVG-КАРТОЧЕК (0 МС ЗАГРУЗКИ)
      *************************************************************************/
-    function renderSvgIllustration(wordObj, mode, article) {
+    function renderSvgIllustration(wordObj, showGenderColor, article) {
       let palette = { bg1: "#f5f5f4", bg2: "#e7e5e4", accent: "#a8a29e" };
-      if (mode === "study") {
+      if (showGenderColor) {
         if (article === "der") palette = { bg1: "#eff6ff", bg2: "#dbeafe", accent: "#3b82f6" };
         if (article === "die") palette = { bg1: "#fdf2f8", bg2: "#fce7f3", accent: "#ec4899" };
         if (article === "das") palette = { bg1: "#ecfdf5", bg2: "#d1fae5", accent: "#10b981" };
@@ -952,7 +965,7 @@
       Object.keys(prog).forEach(deckId => {
         const rec = prog[deckId];
         if (rec && rec.learnedIds && rec.learnedIds.length > 0) {
-          compact[deckId] = [rec.learnedIds, rec.studyIndex || 0, rec.testIndex || 0];
+          compact[deckId] = [rec.learnedIds, rec.studyIndex || 0, rec.testIndex || 0, rec.articleQuizIndex || 0];
         }
       });
       const payload = JSON.stringify({ u: state.user, d: compact });
@@ -974,6 +987,7 @@
               learnedIds: arr[0] || [],
               studyIndex: arr[1] || 0,
               testIndex: arr[2] || 0,
+              articleQuizIndex: arr[3] || 0,
               updatedAt: Date.now()
             });
           }
@@ -1261,101 +1275,9 @@
         });
       });
     }
-
-    // Запуск проверки по всем изученным словам пользователя (в случайном порядке)
-    function startAllLearnedQuiz() {
-      const learnedPool = collectAllLearnedWords(state.user);
-      if (!learnedPool.length) return;
-
-      // Перемешиваем изученные слова случайным образом (Fisher-Yates)
-      const shuffled = [...learnedPool];
-      for (let i = shuffled.length - 1; i > 0; i--) {
-        const j = Math.floor(Math.random() * (i + 1));
-        const tmp = shuffled[i];
-        shuffled[i] = shuffled[j];
-        shuffled[j] = tmp;
-      }
-
-      state.mode = "learned_quiz";
-      state.quizPool = shuffled;
-      state.cardIndex = 0;
-      state.sessionCorrect = 0;
-      state.sessionAnswered = 0;
-      state.mistakes = [];
-      state.feedback = null;
-      state.testInput = "";
-      state.screen = "session";
-      render();
-    }
-
-    function renderSyncModal() {
-      const code = generateBackupCode();
-      return `
-        <div class="fixed inset-0 z-50 bg-black/40 backdrop-blur-xs flex items-center justify-center p-4">
-          <div class="bg-white rounded-3xl p-5 w-full max-w-sm shadow-xl border border-stone-200 animate-card">
-            <div class="flex items-center justify-between mb-2">
-              <h3 class="text-sm font-bold text-stone-800">Резервный код прогресса (${VALID_USERS[state.user].displayName})</h3>
-              <button id="closeSyncBtn" class="text-stone-400 text-sm px-2 py-1">✕</button>
-            </div>
-            <p class="text-[11px] text-stone-500 leading-relaxed mb-3">
-              Ваш прогресс сохраняется автоматически. Если вы хотите перенести его между браузером и иконкой «На экран Домой» или на другое устройство — скопируйте код:
-            </p>
-            <textarea
-              id="backupCodeArea"
-              rows="3"
-              class="w-full p-2.5 rounded-2xl bg-stone-50 border border-stone-200 text-[11px] font-mono text-stone-700 focus:outline-none focus:border-stone-400 mb-2"
-              placeholder="Вставьте сюда код для восстановления..."
-            >${code}</textarea>
-
-            ${state.syncStatusMsg ? `
-              <div class="text-xs font-medium text-emerald-700 bg-emerald-50 border border-emerald-200 rounded-xl px-3 py-1.5 mb-2 text-center">
-                ${state.syncStatusMsg}
-              </div>
-            ` : ''}
-
-            <div class="grid grid-cols-2 gap-2">
-              <button id="copyCodeBtn" class="soft-btn py-2.5 rounded-xl bg-stone-100 text-stone-700 font-semibold text-xs">
-                📋 Скопировать
-              </button>
-              <button id="restoreCodeBtn" class="soft-btn py-2.5 rounded-xl bg-stone-800 text-white font-semibold text-xs">
-                📥 Загрузить код
-              </button>
-            </div>
-          </div>
-        </div>
-      `;
-    }
-
-    function bindSyncModalEvents() {
-      document.getElementById("closeSyncBtn").addEventListener("click", () => {
-        state.showSyncModal = false;
-        render();
-      });
-
-      document.getElementById("copyCodeBtn").addEventListener("click", () => {
-        const area = document.getElementById("backupCodeArea");
-        if (!area) return;
-        area.select();
-        try {
-          document.execCommand("copy");
-          state.syncStatusMsg = "Код скопирован в буфер обмена!";
-          render();
-        } catch (e) {}
-      });
-
-      document.getElementById("restoreCodeBtn").addEventListener("click", () => {
-        const area = document.getElementById("backupCodeArea");
-        if (!area || !area.value.trim()) return;
-        const ok = restoreFromBackupCode(area.value);
-        state.syncStatusMsg = ok
-          ? "Прогресс успешно восстановлен и объединён!"
-          : "Неверный формат кода";
-        render();
-      });
-    }
-
-    /* ЭКРАН 3: ВЫБОР РЕЖИМА ДЛЯ КАТЕГОРИИ (ИЗУЧЕНИЕ ИЛИ ПРОВЕРКА) */
+    /* ЭКРАН 3: ВЫБОР РЕЖИМА ДЛЯ КАТЕГОРИИ (3 ВАРИАНТА ВЗАИМОДЕЙСТВИЯ) */
     function renderModeSelect() {
+      clearAutoAdvanceTimer();
       const deck = DECKS[state.selectedDeckId];
       const prog = getDeckState(deck.id);
 
@@ -1377,39 +1299,57 @@
             </div>
           </div>
 
-          <div class="bg-white rounded-3xl p-5 shadow-sm border border-stone-200/80 text-center my-auto">
-            <div class="w-16 h-16 rounded-3xl bg-stone-50 border border-stone-100 flex items-center justify-center text-4xl mx-auto mb-2.5">
+          <div class="bg-white rounded-3xl p-4 shadow-sm border border-stone-200/80 text-center my-auto">
+            <div class="w-14 h-14 rounded-2xl bg-stone-50 border border-stone-100 flex items-center justify-center text-3xl mx-auto mb-2">
               ${deck.icon}
             </div>
-            <h2 class="text-lg font-bold text-stone-800">${deck.title}</h2>
-            <p class="text-xs text-stone-400 mt-0.5 mb-5">
+            <h2 class="text-base font-bold text-stone-800">${deck.title}</h2>
+            <p class="text-[11px] text-stone-400 mt-0.5 mb-3.5">
               50 самых нужных существительных · выберите режим
             </p>
 
-            <div class="space-y-2.5 text-left">
-              <button id="startStudyBtn" class="soft-btn w-full p-4 rounded-2xl bg-stone-50 hover:bg-stone-100/80 border border-stone-200/90 flex items-center gap-3.5">
-                <div class="w-11 h-11 rounded-2xl bg-blue-50 text-blue-600 flex items-center justify-center text-xl shrink-0">
+            <div class="space-y-2 text-left">
+              <!-- Режим 1: Изучение с цветной подсказкой -->
+              <button id="startStudyBtn" class="soft-btn w-full p-3.5 rounded-2xl bg-stone-50 hover:bg-stone-100/80 border border-stone-200/90 flex items-center gap-3">
+                <div class="w-10 h-10 rounded-2xl bg-blue-50 text-blue-600 flex items-center justify-center text-lg shrink-0">
                   🎨
                 </div>
-                <div class="flex-1">
-                  <div class="flex items-center justify-between">
-                    <span class="text-sm font-bold text-stone-800">1. Изучение</span>
-                    ${prog.studyIndex > 0 ? `<span class="text-[11px] font-semibold text-blue-600">С карты #${prog.studyIndex + 1} →</span>` : ''}
+                <div class="flex-1 min-w-0">
+                  <div class="flex items-center justify-between gap-1">
+                    <span class="text-xs font-bold text-stone-800">1. Изучение (с подсказкой)</span>
+                    ${prog.studyIndex > 0 ? `<span class="text-[10px] font-semibold text-blue-600 shrink-0">С #${prog.studyIndex + 1} →</span>` : ''}
                   </div>
                   <div class="text-[11px] text-stone-500 leading-snug mt-0.5">
-                    Картинка в рамке цвета рода (<span class="text-blue-600 font-semibold">der</span>, <span class="text-pink-600 font-semibold">die</span>, <span class="text-emerald-600 font-semibold">das</span>) и выбор артикля из трёх
+                    Рамка сразу подсказывает род (<span class="text-blue-600 font-semibold">der</span>, <span class="text-pink-600 font-semibold">die</span>, <span class="text-emerald-600 font-semibold">das</span>) + выбор из 3 кнопок
                   </div>
                 </div>
               </button>
 
-              <button id="startTestBtn" class="soft-btn w-full p-4 rounded-2xl bg-stone-50 hover:bg-stone-100/80 border border-stone-200/90 flex items-center gap-3.5">
-                <div class="w-11 h-11 rounded-2xl bg-emerald-50 text-emerald-600 flex items-center justify-center text-xl shrink-0">
+              <!-- Режим 2: Угадывание артикля без подсказки рамкой (рамка загорается после ответа) -->
+              <button id="startArticleQuizBtn" class="soft-btn w-full p-3.5 rounded-2xl bg-stone-50 hover:bg-stone-100/80 border border-stone-200/90 flex items-center gap-3">
+                <div class="w-10 h-10 rounded-2xl bg-pink-50 text-pink-600 flex items-center justify-center text-lg shrink-0">
+                  🎯
+                </div>
+                <div class="flex-1 min-w-0">
+                  <div class="flex items-center justify-between gap-1">
+                    <span class="text-xs font-bold text-stone-800">2. Тренировка артикля (без рамки)</span>
+                    ${prog.articleQuizIndex > 0 ? `<span class="text-[10px] font-semibold text-pink-600 shrink-0">С #${prog.articleQuizIndex + 1} →</span>` : ''}
+                  </div>
+                  <div class="text-[11px] text-stone-500 leading-snug mt-0.5">
+                    Выбор цветной кнопки <span class="text-blue-600 font-semibold">der</span> / <span class="text-pink-600 font-semibold">die</span> / <span class="text-emerald-600 font-semibold">das</span> · цвет рамки откроется после ответа
+                  </div>
+                </div>
+              </button>
+
+              <!-- Режим 3: Письменная проверка -->
+              <button id="startTestBtn" class="soft-btn w-full p-3.5 rounded-2xl bg-stone-50 hover:bg-stone-100/80 border border-stone-200/90 flex items-center gap-3">
+                <div class="w-10 h-10 rounded-2xl bg-emerald-50 text-emerald-600 flex items-center justify-center text-lg shrink-0">
                   ✍️
                 </div>
-                <div class="flex-1">
-                  <div class="flex items-center justify-between">
-                    <span class="text-sm font-bold text-stone-800">2. Проверка</span>
-                    ${prog.testIndex > 0 ? `<span class="text-[11px] font-semibold text-emerald-600">С карты #${prog.testIndex + 1} →</span>` : ''}
+                <div class="flex-1 min-w-0">
+                  <div class="flex items-center justify-between gap-1">
+                    <span class="text-xs font-bold text-stone-800">3. Проверка (письменно)</span>
+                    ${prog.testIndex > 0 ? `<span class="text-[10px] font-semibold text-emerald-600 shrink-0">С #${prog.testIndex + 1} →</span>` : ''}
                   </div>
                   <div class="text-[11px] text-stone-500 leading-snug mt-0.5">
                     Картинка без цветной рамки + ввод артикля вместе со словом
@@ -1442,12 +1382,17 @@
         startDeckSession("study", prog.studyIndex || 0);
       });
 
+      document.getElementById("startArticleQuizBtn").addEventListener("click", () => {
+        startDeckSession("article_quiz", prog.articleQuizIndex || 0);
+      });
+
       document.getElementById("startTestBtn").addEventListener("click", () => {
         startDeckSession("test", prog.testIndex || 0);
       });
     }
 
     function startDeckSession(mode, startIdx = 0) {
+      clearAutoAdvanceTimer();
       state.mode = mode;
       state.cardIndex = startIdx >= 0 && startIdx < 50 ? startIdx : 0;
       state.sessionCorrect = 0;
@@ -1459,9 +1404,10 @@
       render();
     }
 
-    /* ЭКРАН 4: ТРЕНИРОВКА (ИЗУЧЕНИЕ / ПРОВЕРКА КОЛОДЫ / ПРОВЕРКА ВСЕХ ИЗУЧЕННЫХ СЛОВ) */
+    /* ЭКРАН 4: ТРЕНИРОВКА (ИЗУЧЕНИЕ / ТРЕНИРОВКА АРТИКЛЯ / ПРОВЕРКА КОЛОДЫ / ПРОВЕРКА ВСЕХ ИЗУЧЕННЫХ СЛОВ) */
     function renderSession() {
       const isLearnedQuiz = state.mode === "learned_quiz";
+      const isArticleSelectionMode = state.mode === "study" || state.mode === "article_quiz";
       let wordObj = null;
       let total = 0;
       let headerInfoHtml = "";
@@ -1490,9 +1436,13 @@
 
       const progressPct = Math.round(((state.cardIndex + 1) / total) * 100);
 
+      // В режиме "study" цвет рамки виден сразу.
+      // В режиме "article_quiz" рамка нейтральная до ответа и окрашивается в цвет рода сразу после выбора артикля.
+      const showGenderFrame = state.mode === "study" || (state.mode === "article_quiz" && Boolean(state.feedback));
+
       let frameClass = "frame-neutral";
       let genderBadge = "";
-      if (state.mode === "study") {
+      if (showGenderFrame) {
         if (wordObj.article === "der") {
           frameClass = "frame-der";
           genderBadge = `<span class="px-2.5 py-0.5 rounded-full text-[11px] font-semibold bg-blue-100 text-blue-700">мужской род · синий</span>`;
@@ -1503,6 +1453,8 @@
           frameClass = "frame-das";
           genderBadge = `<span class="px-2.5 py-0.5 rounded-full text-[11px] font-semibold bg-emerald-100 text-emerald-700">средний род · зелёный</span>`;
         }
+      } else if (state.mode === "article_quiz") {
+        genderBadge = `<span class="px-2.5 py-0.5 rounded-full text-[11px] font-medium bg-stone-100 text-stone-500">Угадайте артикль · цвет откроется после выбора</span>`;
       } else if (isLearnedQuiz) {
         genderBadge = `<span class="px-2.5 py-0.5 rounded-full text-[11px] font-medium bg-stone-100 text-stone-600">${currentDeckTitle}</span>`;
       } else {
@@ -1536,13 +1488,13 @@
               ${!isLearnedQuiz && isAlreadyLearned ? `<span class="px-2 py-0.5 rounded-full text-[10px] font-semibold bg-emerald-50 text-emerald-700 border border-emerald-200">✓ Выучено</span>` : ''}
             </div>
 
-            <div class="relative w-full max-w-[265px] aspect-[240/165] rounded-3xl p-2 transition-all duration-200 ${frameClass}">
-              ${renderSvgIllustration(wordObj, state.mode, wordObj.article)}
+            <div class="relative w-full max-w-[265px] aspect-[240/165] rounded-3xl p-2 transition-all duration-300 ${frameClass}">
+              ${renderSvgIllustration(wordObj, showGenderFrame, wordObj.article)}
             </div>
 
             <!-- Слово и аккуратная круглая кнопка микрофона (строго по нажатию) -->
             <div class="text-center mt-2.5">
-              ${state.mode === "study" ? `
+              ${isArticleSelectionMode ? `
                 <div class="flex items-center justify-center gap-2">
                   <h3 class="text-2xl font-bold text-stone-800 tracking-tight">${wordObj.de}</h3>
                   <button
@@ -1576,18 +1528,20 @@
 
           <!-- Нижний блок взаимодействия -->
           <div class="bg-white rounded-3xl p-3.5 shadow-sm border border-stone-200/80">
-            ${state.mode === "study" ? renderStudyControls(wordObj) : renderTestControls(wordObj)}
+            ${isArticleSelectionMode ? renderStudyControls(wordObj) : renderTestControls(wordObj)}
           </div>
         </div>
       `;
 
       document.getElementById("exitSessionBtn").addEventListener("click", () => {
+        clearAutoAdvanceTimer();
         persistUserProgressNow(state.user);
         state.screen = "categories";
         render();
       });
 
       document.getElementById("finishNowBtn").addEventListener("click", () => {
+        clearAutoAdvanceTimer();
         persistUserProgressNow(state.user);
         state.screen = "summary";
         render();
@@ -1602,7 +1556,7 @@
         });
       }
 
-      if (state.mode === "study") {
+      if (isArticleSelectionMode) {
         bindStudyEvents(wordObj);
       } else {
         bindTestEvents(wordObj);
@@ -1610,34 +1564,81 @@
     }
 
     function renderStudyControls(wordObj) {
-      if (state.feedback) {
-        const isOk = state.feedback.isCorrect;
-        return `
-          <div class="text-center space-y-2.5">
-            <div class="py-2.5 px-4 rounded-2xl text-sm font-semibold ${isOk ? 'bg-emerald-50 text-emerald-700 border border-emerald-200' : 'bg-rose-50 text-rose-700 border border-rose-200'}">
-              ${isOk ? `Верно! ${wordObj.article} ${wordObj.de}` : `Ошибка · правильно: ${wordObj.article} ${wordObj.de}`}
-            </div>
-            <button id="nextCardBtn" class="soft-btn w-full py-3.5 rounded-2xl bg-stone-800 text-white font-semibold text-sm">
-              Дальше →
-            </button>
-          </div>
-        `;
-      }
+      const hasFeedback = Boolean(state.feedback);
+      const chosenArt = hasFeedback ? state.feedback.userAnswer : null;
+      const isOk = hasFeedback ? state.feedback.isCorrect : false;
+
+      const getArtBtnClasses = (art, baseClasses, activeCorrectClasses, activeWrongClasses) => {
+        if (!hasFeedback) return baseClasses;
+        if (art === wordObj.article) return activeCorrectClasses;
+        if (art === chosenArt && !isOk) return activeWrongClasses;
+        return baseClasses + " opacity-45";
+      };
+
+      const derClasses = getArtBtnClasses(
+        "der",
+        "bg-blue-50 hover:bg-blue-100 border-2 border-blue-300 text-blue-700",
+        "bg-blue-600 border-2 border-blue-600 text-white ring-4 ring-blue-200",
+        "bg-rose-50 border-2 border-rose-400 text-rose-700 line-through"
+      );
+      const dieClasses = getArtBtnClasses(
+        "die",
+        "bg-pink-50 hover:bg-pink-100 border-2 border-pink-300 text-pink-700",
+        "bg-pink-500 border-2 border-pink-500 text-white ring-4 ring-pink-200",
+        "bg-rose-50 border-2 border-rose-400 text-rose-700 line-through"
+      );
+      const dasClasses = getArtBtnClasses(
+        "das",
+        "bg-emerald-50 hover:bg-emerald-100 border-2 border-emerald-300 text-emerald-700",
+        "bg-emerald-500 border-2 border-emerald-500 text-white ring-4 ring-emerald-200",
+        "bg-rose-50 border-2 border-rose-400 text-rose-700 line-through"
+      );
 
       return `
-        <div>
-          <div class="text-center text-xs text-stone-400 mb-2">Выберите правильный артикль:</div>
+        <div class="space-y-2.5">
+          ${!hasFeedback ? `
+            <div class="text-center text-xs text-stone-400">Выберите правильный артикль:</div>
+          ` : `
+            <div class="py-1.5 px-3 rounded-xl text-xs font-semibold text-center ${
+              isOk
+                ? 'bg-emerald-50 text-emerald-700 border border-emerald-200'
+                : 'bg-rose-50 text-rose-700 border border-rose-200'
+            }">
+              ${isOk
+                ? `✓ Верно! ${wordObj.article} ${wordObj.de}`
+                : `Ошибка · правильно: ${wordObj.article} ${wordObj.de}`}
+            </div>
+          `}
+
           <div class="grid grid-cols-3 gap-2.5">
-            <button data-art="der" class="art-btn soft-btn py-3.5 rounded-2xl bg-blue-50 hover:bg-blue-100 border-2 border-blue-300 text-blue-700 font-bold text-base shadow-sm">
-              der
+            <button
+              data-art="der"
+              ${hasFeedback ? 'disabled' : ''}
+              class="art-btn soft-btn py-3.5 rounded-2xl font-bold text-base shadow-sm transition-all ${derClasses}"
+            >
+              ${hasFeedback && wordObj.article === 'der' ? '✓ der' : 'der'}
             </button>
-            <button data-art="die" class="art-btn soft-btn py-3.5 rounded-2xl bg-pink-50 hover:bg-pink-100 border-2 border-pink-300 text-pink-700 font-bold text-base shadow-sm">
-              die
+            <button
+              data-art="die"
+              ${hasFeedback ? 'disabled' : ''}
+              class="art-btn soft-btn py-3.5 rounded-2xl font-bold text-base shadow-sm transition-all ${dieClasses}"
+            >
+              ${hasFeedback && wordObj.article === 'die' ? '✓ die' : 'die'}
             </button>
-            <button data-art="das" class="art-btn soft-btn py-3.5 rounded-2xl bg-emerald-50 hover:bg-emerald-100 border-2 border-emerald-300 text-emerald-700 font-bold text-base shadow-sm">
-              das
+            <button
+              data-art="das"
+              ${hasFeedback ? 'disabled' : ''}
+              class="art-btn soft-btn py-3.5 rounded-2xl font-bold text-base shadow-sm transition-all ${dasClasses}"
+            >
+              ${hasFeedback && wordObj.article === 'das' ? '✓ das' : 'das'}
             </button>
           </div>
+
+          ${hasFeedback ? `
+            <button id="nextCardBtn" class="soft-btn w-full py-3 rounded-2xl bg-stone-800 text-white font-semibold text-sm">
+              Дальше →
+            </button>
+          ` : ''}
         </div>
       `;
     }
@@ -1645,6 +1646,7 @@
     function bindStudyEvents(wordObj) {
       document.querySelectorAll(".art-btn").forEach(btn => {
         btn.addEventListener("click", () => {
+          if (state.feedback) return;
           const chosen = btn.getAttribute("data-art");
           const isCorrect = chosen === wordObj.article;
           state.sessionAnswered++;
@@ -1663,18 +1665,21 @@
             state.cardIndex,
             isCorrect,
             state.cardIndex + 1,
-            "study"
+            state.mode
           );
 
-          if (isCorrect) {
+          if (state.mode === "study" && isCorrect) {
             advanceOrSummarize();
           } else {
+            // В режиме "article_quiz" (и при ошибке в "study") сразу зажигаем цветную рамку рода
             state.feedback = {
-              isCorrect: false,
+              isCorrect,
               userAnswer: chosen,
               correctFull: `${wordObj.article} ${wordObj.de}`
             };
             render();
+
+            
           }
         });
       });
@@ -1682,6 +1687,7 @@
       const nextBtn = document.getElementById("nextCardBtn");
       if (nextBtn) {
         nextBtn.addEventListener("click", () => {
+          clearAutoAdvanceTimer();
           state.feedback = null;
           advanceOrSummarize();
         });
@@ -1851,6 +1857,7 @@
 
     /* ЭКРАН 5: ИТОГ ПО КОЛОДЕ ИЛИ ПО ВСЕМ ИЗУЧЕННЫМ СЛОВАМ */
     function renderSummary() {
+      clearAutoAdvanceTimer();
       const isLearnedQuiz = state.mode === "learned_quiz";
       let title = "";
       let subtitle = "";
@@ -1876,7 +1883,12 @@
         const deckProg = getDeckState(deck.id);
         badgeEmoji = deckProg.percent >= 80 ? "🏆" : deckProg.percent >= 50 ? "👏" : "🌱";
         title = deck.title;
-        subtitle = `Режим: ${state.mode === "study" ? "Изучение" : "Проверка"} · Профиль: ${VALID_USERS[state.user].displayName}`;
+        const modeTitle = state.mode === "study"
+          ? "Изучение"
+          : state.mode === "article_quiz"
+            ? "Тренировка артикля"
+            : "Проверка";
+        subtitle = `Режим: ${modeTitle} · Профиль: ${VALID_USERS[state.user].displayName}`;
         statLeftTop = `${deckProg.correct} / 50`;
         statLeftBottom = "Всего изучено в колоде";
         statRightTop = `${deckProg.percent}%`;
