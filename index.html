@@ -1668,19 +1668,15 @@
             state.mode
           );
 
-          if (state.mode === "study" && isCorrect) {
-            advanceOrSummarize();
-          } else {
-            // В режиме "article_quiz" (и при ошибке в "study") сразу зажигаем цветную рамку рода
-            state.feedback = {
-              isCorrect,
-              userAnswer: chosen,
-              correctFull: `${wordObj.article} ${wordObj.de}`
-            };
-            render();
+          state.feedback = {
+            isCorrect,
+            userAnswer: chosen,
+            correctFull: `${wordObj.article} ${wordObj.de}`
+          };
+          render();
 
-            
-          }
+          // Автоматическая озвучка слова с артиклем сразу после выбора ответа
+          speakGermanWordWithArticle(wordObj);
         });
       });
 
@@ -1827,6 +1823,9 @@
           };
           state.testInput = "";
           render();
+
+          // Автоматическая озвучка слова с артиклем сразу после отправки ответа
+          speakGermanWordWithArticle(wordObj);
         });
       }
 
